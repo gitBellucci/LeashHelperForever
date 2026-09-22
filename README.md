@@ -14,9 +14,14 @@ Inspired by the [Leash helper](https://wago.io/f1tzlceQj) WeakAura. Forever bloc
 
 ## Install
 
-1. Copy the `LeashHelper` folder into `World of Warcraft\_classic_beta_\Interface\AddOns\`
-2. Restart WoW or `/reload`
-3. Enable **LeashHelperForever** in the addon list
+Prefer the [release zip](https://github.com/gitBellucci/LeashHelperForever/releases/latest) (`LeashHelper.zip`). Do **not** use GitHub’s green **Code → Download ZIP** unless you rename the folder.
+
+1. Extract so the folder is named exactly **`LeashHelper`** (not `LeashHelper-main` or `LeashHelperForever-main`)
+2. Put that folder in `World of Warcraft\_classic_beta_\Interface\AddOns\`
+3. Restart WoW (a `/reload` is not enough the first time)
+4. Enable **LeashHelperForever** in the addon list
+
+If it does not appear: the folder name must match the `.toc` file. Rename `LeashHelper-main` → `LeashHelper`.
 
 ## Use
 

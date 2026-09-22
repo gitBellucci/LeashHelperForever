@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1
+
+- Leash list only tracks hostile NPCs you engage. Player characters, your own character, pets, and party/raid members are never shown.
+
 ## 1.0.0
 
 - First public release

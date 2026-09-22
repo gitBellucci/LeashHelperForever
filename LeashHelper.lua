@@ -187,19 +187,128 @@ local function IsVolatileUnit(unit)
 		or (type(unit) == "string" and unit:find("target$") ~= nil and (unit:find("^party") or unit:find("^raid")))
 end
 
-local function UsableMob(unit)
-	if not unit or unit == "player" or unit == "pet" then
+local function UnitIsPlayerSafe(unit)
+	if not Exists(unit) or not UnitIsPlayer then
+		return nil
+	end
+	local ok, v = pcall(UnitIsPlayer, unit)
+	if not ok or v == nil or IsSecret(v) then
+		return nil
+	end
+	if v then
+		return true
+	end
+	return false
+end
+
+local function GuidKind(unit)
+	local guid = SafeGUID(unit)
+	if not guid then
+		return nil
+	end
+	return guid:match("^(%a+)-")
+end
+
+local function IsGroupUnit(unit)
+	if not unit or not Exists(unit) then
 		return false
 	end
-	if not Exists(unit) or Dead(unit) then
+	if unit == "player" or unit == "pet" or SameUnit(unit, "player") then
+		return true
+	end
+	if Exists("pet") and SameUnit(unit, "pet") then
+		return true
+	end
+	if IsInRaid() then
+		for i = 1, GetNumGroupMembers() do
+			if SameUnit(unit, "raid" .. i) or SameUnit(unit, "raidpet" .. i) then
+				return true
+			end
+		end
+	elseif IsInGroup() then
+		for i = 1, math.max(GetNumGroupMembers() - 1, 0) do
+			if SameUnit(unit, "party" .. i) or SameUnit(unit, "partypet" .. i) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function CreatureTypeSafe(unit)
+	if not Exists(unit) or not UnitCreatureType then
+		return nil
+	end
+	local ok, t = pcall(UnitCreatureType, unit)
+	if not ok then
+		return nil
+	end
+	return SafeStr(t)
+end
+
+-- Only NPCs you can fight. Never the player, pet, party, or other players.
+local function HostileNPC(unit)
+	if not unit or not Exists(unit) or Dead(unit) then
 		return false
+	end
+	if unit == "player" or unit == "pet" or IsGroupUnit(unit) then
+		return false
+	end
+	local kind = GuidKind(unit)
+	if kind == "Player" or kind == "Pet" then
+		return false
+	end
+	if UnitIsPlayerSafe(unit) == true then
+		return false
+	end
+	local myName = SafeName("player")
+	local name = SafeName(unit)
+	if myName and name and name == myName then
+		return false
+	end
+	if UnitIsFriend then
+		local ok, friend = pcall(UnitIsFriend, "player", unit)
+		if ok and friend ~= nil and not IsSecret(friend) and friend then
+			return false
+		end
 	end
 	if Enemy(unit) then
 		return true
 	end
-	-- Forever may hide UnitCanAttack on nameplates. Still treat a live plate as
-	-- a mob if we are already in combat.
+	-- Forever may hide UnitCanAttack on nameplates. Still allow a live plate
+	-- only when we can prove it is an NPC, not a player.
 	if inCombat and (IsNameplateToken(unit) or IsVolatileUnit(unit)) then
+		if kind == "Creature" or kind == "Vehicle" then
+			return true
+		end
+		if CreatureTypeSafe(unit) then
+			return true
+		end
+		if UnitIsPlayerSafe(unit) == false then
+			return true
+		end
+	end
+	return false
+end
+
+local function RecIsNotNPC(rec)
+	if not rec then
+		return true
+	end
+	local u = rec.anchor or rec.unit
+	if u and Exists(u) and not HostileNPC(u) then
+		return true
+	end
+	if rec.guid and type(rec.guid) == "string" then
+		if rec.guid:find("^Player-") or rec.guid:find("^Pet-") then
+			return true
+		end
+	end
+	local myName = SafeName("player")
+	if myName and rec.name == myName then
+		if u and Exists(u) and HostileNPC(u) then
+			return false
+		end
 		return true
 	end
 	return false
@@ -335,7 +444,7 @@ end
 function LH.PublicMobTokens()
 	local list = {}
 	local function add(token)
-		if Exists(token) and Enemy(token) then
+		if Exists(token) and HostileNPC(token) then
 			list[#list + 1] = token
 		end
 	end
@@ -382,7 +491,7 @@ local function ResolvePublicUnit(unit)
 end
 
 local function MobKey(unit)
-	if not UsableMob(unit) then
+	if not HostileNPC(unit) then
 		return nil, nil
 	end
 	local guid = SafeGUID(unit)
@@ -558,7 +667,7 @@ local function EachVisibleEnemy(fn)
 		if not token or not Exists(token) or Dead(token) then
 			return
 		end
-		if not Enemy(token) and not (inCombat and IsNameplateToken(token)) then
+		if not HostileNPC(token) then
 			return
 		end
 		local guid = SafeGUID(token)
@@ -710,7 +819,11 @@ local function Prune()
 	end
 	for key, rec in pairs(mobs) do
 		if key ~= "test" then
-			DropIfLeftCombat(key, rec)
+			if RecIsNotNPC(rec) then
+				DropKey(key)
+			else
+				DropIfLeftCombat(key, rec)
+			end
 		end
 	end
 	DropUnmatchedExtras()
@@ -755,7 +868,9 @@ end
 local function OrderedMobs()
 	local list = {}
 	for key, rec in pairs(mobs) do
-		list[#list + 1] = rec
+		if key == "test" or not RecIsNotNPC(rec) then
+			list[#list + 1] = rec
+		end
 	end
 	table.sort(list, function(a, b)
 		return LH.Remaining(a) < LH.Remaining(b)
@@ -1014,12 +1129,12 @@ end
 local function HandleCombatHit(unit, action)
 	action = SafeStr(action)
 	local resolved = ResolvePublicUnit(unit)
-	if resolved == "player" or resolved == "pet" then
+	-- Hits on you / your pet / group: refresh the mob you are fighting.
+	-- Never start a timer on the player nameplate or another player.
+	if IsGroupUnit(unit) or resolved == "player" or resolved == "pet" or IsGroupUnit(resolved) then
 		if action == "WOUND" and PlayerStill() then
-			if Exists("target") then
+			if HostileNPC("target") then
 				LH.ResetLeash("target", "melee-still")
-			else
-				LH.ResetLeash(nil, "melee-still")
 			end
 		end
 		return
@@ -1027,13 +1142,11 @@ local function HandleCombatHit(unit, action)
 	if action ~= "WOUND" and action ~= "DODGE" and action ~= "PARRY" and action ~= "MISS" and action ~= "BLOCK" and action ~= "RESIST" then
 		return
 	end
-	if resolved then
-		LH.ResetLeash(resolved, "combat")
-	elseif unit and Exists(unit) then
-		LH.ResetLeash(unit, "combat")
-	else
-		LH.ResetLeash(nil, "combat")
+	local victim = resolved or unit
+	if not HostileNPC(victim) then
+		return
 	end
+	LH.ResetLeash(victim, "combat")
 end
 
 local function HandleCleU()
@@ -1057,6 +1170,9 @@ local function HandleCleU()
 		or subevent == "SPELL_PERIODIC_DAMAGE"
 		or subevent == "SPELL_AURA_APPLIED" or subevent == "SPELL_AURA_REFRESH"
 	if not mine or not hostile then
+		return
+	end
+	if destGUID:find("^Player-") or destGUID:find("^Pet-") then
 		return
 	end
 	-- Map dest GUID onto a public unit we can see.
@@ -1204,7 +1320,7 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
 	end
 	if event == "PLAYER_REGEN_DISABLED" then
 		inCombat = true
-		if Enemy("target") then
+		if HostileNPC("target") then
 			LH.ResetLeash("target", "pull")
 		end
 		StartTicker()
@@ -1259,10 +1375,8 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
 			return
 		end
 		local dest = unit == "pet" and "pettarget" or "target"
-		if Enemy(dest) then
+		if HostileNPC(dest) then
 			LH.ResetLeash(dest, "cast")
-		else
-			LH.ResetLeash(nil, "cast")
 		end
 	elseif event == "UNIT_COMBAT" then
 		HandleCombatHit(arg1, arg2)

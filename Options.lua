@@ -310,7 +310,7 @@ local function CreateOptions()
 	local ar, ag, ab = Accent()
 	local f = CreateFrame("Frame", "LeashHelperOptions", UIParent)
 	f:Hide()
-	f:SetSize(460, 640)
+	f:SetSize(460, 670)
 	f:SetPoint("CENTER")
 	f:SetFrameStrata("DIALOG")
 	f:SetToplevel(true)
@@ -376,6 +376,7 @@ local function CreateOptions()
 
 	local opts = {
 		{ "Enable addon", "enabled", "Master toggle." },
+		{ "Disable in dungeons", "disableInDungeons", "On by default. Hides the addon in 5-man dungeons. Open world stays on." },
 		{ "Lock", "locked", "Prevent dragging the display." },
 		{ "Show portraits", "showPortraits", "Mob face on each row. Turn off for dense AoE packs." },
 		{ "Show names", "showNames", "Mob name next to the timer." },

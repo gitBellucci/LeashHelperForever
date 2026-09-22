@@ -25,7 +25,7 @@ If it does not appear: the folder name must match the `.toc` file. Rename `Leash
 
 ## Use
 
-- `/leash` — options (preview, font, sizes, portraits, names)
+- `/leash` — options (preview, font, sizes, portraits, names, disable in dungeons)
 - `/leash lock` — lock or unlock dragging
 - `/leash test` — sample timer
 - `/leash reset` — reset position

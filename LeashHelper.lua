@@ -31,6 +31,7 @@ local IsInGroup = IsInGroup
 
 local defaults = {
 	enabled = true,
+	disableInDungeons = true,
 	locked = false,
 	showPortraits = true,
 	showNames = true,
@@ -94,6 +95,29 @@ local function Exists(unit)
 	end
 	local ok, v = pcall(UnitExists, unit)
 	return ok and SafeBool(v)
+end
+
+-- 5-man dungeons only (instanceType "party"). Open world and raids stay on.
+local function InDungeon()
+	if not IsInInstance then
+		return false
+	end
+	local ok, inInstance, instanceType = pcall(IsInInstance)
+	if not ok then
+		return false
+	end
+	instanceType = SafeStr(instanceType)
+	return instanceType == "party"
+end
+
+local function AddonActive()
+	if not db or not db.enabled then
+		return false
+	end
+	if db.disableInDungeons and InDungeon() then
+		return false
+	end
+	return true
 end
 
 -- true / false / nil (secret or unknown). Never treat a secret as "out of combat".
@@ -559,7 +583,7 @@ function LH.TimerColor(remain, duration)
 end
 
 function LH.ResetLeash(unit, reason)
-	if not db or not db.enabled then
+	if not AddonActive() then
 		return
 	end
 	local key, token
@@ -642,6 +666,18 @@ end
 local function ClearAll()
 	wipe(mobs)
 	lastFightKey = nil
+end
+
+local function ApplyInstanceState()
+	if not db then
+		return
+	end
+	if db.disableInDungeons and InDungeon() then
+		ClearAll()
+		if window then
+			window:Hide()
+		end
+	end
 end
 
 local function PauseIfCC()
@@ -1051,11 +1087,14 @@ local function CreateWindow()
 end
 
 local function ShouldShowBar()
-	if not db.enabled then
+	if not db or not db.enabled then
 		return false
 	end
 	if testUntil > GetTime() then
 		return true
+	end
+	if not AddonActive() then
+		return false
 	end
 	return next(mobs) ~= nil
 end
@@ -1150,6 +1189,9 @@ local function HandleCombatHit(unit, action)
 end
 
 local function HandleCleU()
+	if not AddonActive() then
+		return
+	end
 	if not CombatLogGetCurrentEventInfo then
 		return
 	end
@@ -1211,10 +1253,13 @@ end
 function LH.OnOptionChanged(key)
 	ApplyLock()
 	LayoutBar()
-	if key == "enabled" and not db.enabled then
-		ClearAll()
-		if window then
-			window:Hide()
+	if key == "enabled" or key == "disableInDungeons" then
+		ApplyInstanceState()
+		if not AddonActive() then
+			ClearAll()
+			if window then
+				window:Hide()
+			end
 		end
 	end
 	Tick()
@@ -1285,6 +1330,7 @@ eventFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 eventFrame:RegisterEvent("UNIT_COMBAT")
 eventFrame:RegisterEvent("UNIT_AURA")
 eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+SafeRegister(eventFrame, "ZONE_CHANGED_NEW_AREA")
 SafeRegister(eventFrame, "UNIT_FLAGS")
 SafeRegister(eventFrame, "NAME_PLATE_UNIT_ADDED")
 SafeRegister(eventFrame, "UNIT_THREAT_SITUATION_UPDATE")
@@ -1313,9 +1359,15 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
 				pcall(events.RegisterEvent, events, "COMBAT_LOG_EVENT_UNFILTERED")
 			end
 		end
+		ApplyInstanceState()
 		return
 	end
-	if not db or not db.enabled then
+	if event == "ZONE_CHANGED_NEW_AREA" then
+		ApplyInstanceState()
+		Tick()
+		return
+	end
+	if not AddonActive() then
 		return
 	end
 	if event == "PLAYER_REGEN_DISABLED" then

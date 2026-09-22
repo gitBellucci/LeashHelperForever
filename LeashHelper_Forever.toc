@@ -1,5 +1,5 @@
 ## Interface: 11601
-## Title: Leash Helper
+## Title: LeashHelperForever
 ## Notes: Estimated Classic leash timer on the mob you are in combat with.
 ## Author: Foofi
 ## Version: 1.0.0

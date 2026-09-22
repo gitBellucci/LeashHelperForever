@@ -1123,7 +1123,7 @@ function LH.StartTest()
 end
 
 local function Print(msg)
-	print("|cff0cd29dLeash Helper|r: " .. msg)
+	print("|cff0cd29dLeashHelperForever|r: " .. msg)
 end
 
 SLASH_LEASHHELPER1 = "/leash"

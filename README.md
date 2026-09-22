@@ -1,4 +1,8 @@
-# Leash Helper
+# LeashHelperForever
+
+<p align="center">
+  <img src="Media/icon.png" alt="LeashHelperForever" width="200">
+</p>
 
 Estimated Classic **leash timer** for [WoW Forever](https://worldofforever.com/). Shows a countdown on each mob you are fighting so you can refresh the leash before they run home.
 
@@ -12,7 +16,7 @@ Inspired by the [Leash helper](https://wago.io/f1tzlceQj) WeakAura. Forever bloc
 
 1. Copy the `LeashHelper` folder into `World of Warcraft\_classic_beta_\Interface\AddOns\`
 2. Restart WoW or `/reload`
-3. Enable **Leash Helper** in the addon list
+3. Enable **LeashHelperForever** in the addon list
 
 ## Use
 

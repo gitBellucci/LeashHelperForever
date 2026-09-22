@@ -347,7 +347,7 @@ local function CreateOptions()
 
 	local title = Font(header, 18, ar, ag, ab, 1)
 	title:SetPoint("TOPLEFT", 18, -12)
-	title:SetText("Leash Helper")
+	title:SetText("LeashHelperForever")
 
 	local sub = Font(header, 12, 1, 1, 1, 0.45)
 	sub:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)

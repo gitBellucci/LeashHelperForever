@@ -4,6 +4,10 @@ Estimated Classic **leash timer** for [WoW Forever](https://worldofforever.com/)
 
 Inspired by the [Leash helper](https://wago.io/f1tzlceQj) WeakAura. Forever blocks combat-log registration under secret restrictions, so this is an estimate from public events — not a hidden server value.
 
+![In-game leash timers](docs/ingame.png)
+
+![Options preview](docs/options.png)
+
 ## Install
 
 1. Copy the `LeashHelper` folder into `World of Warcraft\_classic_beta_\Interface\AddOns\`

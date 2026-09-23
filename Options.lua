@@ -310,7 +310,7 @@ local function CreateOptions()
 	local ar, ag, ab = Accent()
 	local f = CreateFrame("Frame", "LeashHelperOptions", UIParent)
 	f:Hide()
-	f:SetSize(460, 670)
+	f:SetSize(460, 730)
 	f:SetPoint("CENTER")
 	f:SetFrameStrata("DIALOG")
 	f:SetToplevel(true)
@@ -377,7 +377,9 @@ local function CreateOptions()
 	local opts = {
 		{ "Enable addon", "enabled", "Master toggle." },
 		{ "Disable in dungeons", "disableInDungeons", "On by default. Hides the addon in 5-man dungeons. Open world stays on." },
-		{ "Lock", "locked", "Prevent dragging the display." },
+		{ "Lock", "locked", "Prevent dragging the display. Previsualize still lets you drag so you can place it." },
+		{ "Previsualize", "preview", "Show the timer on your screen so you can see where it is and drag it into place. Turn off when you are done." },
+		{ "Debug log", "debug", "Open a copyable log of why the timer shows or hides. Use this if it disappears, then paste the Snapshot text." },
 		{ "Show portraits", "showPortraits", "Mob face on each row. Turn off for dense AoE packs." },
 		{ "Show names", "showNames", "Mob name next to the timer." },
 	}
@@ -469,7 +471,7 @@ local function CreateOptions()
 	note:SetPoint("BOTTOMRIGHT", body, "BOTTOMRIGHT", 0, 0)
 	note:SetJustifyH("LEFT")
 	note:SetWordWrap(true)
-	note:SetText("Each row is one mob you are fighting. When that mob leaves combat, its timer disappears even if you are still fighting something else.")
+	note:SetText("Each row is one mob. Hitting any of them refreshes the leash on the whole pack, like Classic. When a mob dies or leaves combat, only that row disappears.")
 
 	f:SetScript("OnHide", HideMenu)
 	f:SetScript("OnShow", function()

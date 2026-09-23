@@ -2,11 +2,12 @@
   Leash Helper for WoW Classic Forever
 
   Classic leash is a ~11–15s chase timer from last hostile action (or first
-  melee after kiting while standing still). Forever blocks combat-log
-  registration under secret restrictions, so this estimates from public
-  events: UNIT_COMBAT, UNIT_SPELLCAST_SUCCEEDED, and (when allowed) CLEU.
+  melee after kiting while standing still). Linked packs share that timer:
+  striking any one of them refreshes all of them (Vanilla / Classic hotfix).
 
-  It is an estimate, matching the Wago "Leash helper" WeakAura intent.
+  Forever blocks combat-log registration under secret restrictions, so this
+  estimates from public events: UNIT_COMBAT, UNIT_SPELLCAST_SUCCEEDED, and
+  (when allowed) CLEU.
 ]]
 
 local ADDON_NAME = ...
@@ -33,6 +34,8 @@ local defaults = {
 	enabled = true,
 	disableInDungeons = true,
 	locked = false,
+	preview = false,
+	debug = false,
 	showPortraits = true,
 	showNames = true,
 	point = "CENTER",
@@ -44,6 +47,27 @@ local defaults = {
 	nameSize = 12,
 	iconSize = 28,
 }
+
+local debugLines = {}
+local lastTickErr
+local DEBUG_MAX = 160
+
+local function Dbg(fmt, ...)
+	local msg = fmt
+	if select("#", ...) > 0 then
+		local ok, built = pcall(format, fmt, ...)
+		if ok then
+			msg = built
+		end
+	end
+	debugLines[#debugLines + 1] = format("%.1f  %s", GetTime(), tostring(msg))
+	while #debugLines > DEBUG_MAX do
+		table.remove(debugLines, 1)
+	end
+	if LH.RefreshDebug then
+		LH.RefreshDebug()
+	end
+end
 
 local db
 local mobs = {}
@@ -94,7 +118,16 @@ local function Exists(unit)
 		return false
 	end
 	local ok, v = pcall(UnitExists, unit)
-	return ok and SafeBool(v)
+	if not ok then
+		return false
+	end
+	if v == nil or IsSecret(v) then
+		-- Forever may hide UnitExists on target/pettarget. Do not treat that as "gone".
+		return unit == "player" or unit == "pet" or unit == "target" or unit == "focus"
+			or unit == "mouseover" or unit == "pettarget"
+			or (type(unit) == "string" and unit:find("target$") ~= nil)
+	end
+	return v and true or false
 end
 
 -- 5-man dungeons only (instanceType "party"). Open world and raids stay on.
@@ -142,19 +175,31 @@ local function IsNameplateToken(unit)
 	return type(unit) == "string" and unit:find("^nameplate") ~= nil
 end
 
-local function PersistableUnit(unit)
-	if not unit or IsNameplateToken(unit) then
-		return nil
-	end
-	return unit
-end
-
 local function Dead(unit)
-	if not Exists(unit) then
+	if not unit or not Exists(unit) then
 		return false
 	end
-	local ok, v = pcall(UnitIsDead, unit)
-	return ok and SafeBool(v)
+	if UnitIsDead then
+		local ok, v = pcall(UnitIsDead, unit)
+		if ok and v ~= nil and not IsSecret(v) then
+			return v and true or false
+		end
+	end
+	if UnitHealth then
+		local okh, h = pcall(UnitHealth, unit)
+		h = okh and SafeNum(h) or nil
+		if h == 0 then
+			local maxh
+			if UnitHealthMax then
+				local okm, m = pcall(UnitHealthMax, unit)
+				maxh = okm and SafeNum(m) or nil
+			end
+			if maxh == nil or maxh > 0 then
+				return true
+			end
+		end
+	end
+	return false
 end
 
 local function Enemy(unit)
@@ -163,6 +208,24 @@ local function Enemy(unit)
 	end
 	local ok, v = pcall(UnitCanAttack, "player", unit)
 	return ok and SafeBool(v)
+end
+
+-- true / false / nil (secret). Nil must not be treated as "cannot attack".
+local function AttackableState(unit)
+	if not unit or Dead(unit) then
+		return false
+	end
+	if not Exists(unit) then
+		return false
+	end
+	local ok, v = pcall(UnitCanAttack, "player", unit)
+	if not ok or v == nil or IsSecret(v) then
+		return nil
+	end
+	if v then
+		return true
+	end
+	return false
 end
 
 local function SameUnit(a, b)
@@ -225,12 +288,33 @@ local function UnitIsPlayerSafe(unit)
 	return false
 end
 
+local function PlayerControlledSafe(unit)
+	if not Exists(unit) or not UnitPlayerControlled then
+		return nil
+	end
+	local ok, v = pcall(UnitPlayerControlled, unit)
+	if not ok or v == nil or IsSecret(v) then
+		return nil
+	end
+	if v then
+		return true
+	end
+	return false
+end
+
 local function GuidKind(unit)
 	local guid = SafeGUID(unit)
 	if not guid then
 		return nil
 	end
 	return guid:match("^(%a+)-")
+end
+
+local function GuidIsPlayerOrPet(guid)
+	if type(guid) ~= "string" then
+		return false
+	end
+	return guid:find("^Player-") ~= nil or guid:find("^Pet-") ~= nil
 end
 
 local function IsGroupUnit(unit)
@@ -259,35 +343,73 @@ local function IsGroupUnit(unit)
 	return false
 end
 
-local function CreatureTypeSafe(unit)
-	if not Exists(unit) or not UnitCreatureType then
-		return nil
-	end
-	local ok, t = pcall(UnitCreatureType, unit)
-	if not ok then
-		return nil
-	end
-	return SafeStr(t)
-end
-
--- Only NPCs you can fight. Never the player, pet, party, or other players.
-local function HostileNPC(unit)
-	if not unit or not Exists(unit) or Dead(unit) then
+-- Players, pets, totems, and their nameplates. UnitIsUnit on plates is often
+-- secret on Forever, so also match GUID / player-controlled / own name.
+local function IsPlayerSide(unit)
+	if not unit or not Exists(unit) then
 		return false
 	end
-	if unit == "player" or unit == "pet" or IsGroupUnit(unit) then
-		return false
+	if unit == "player" or unit == "pet" then
+		return true
 	end
-	local kind = GuidKind(unit)
-	if kind == "Player" or kind == "Pet" then
-		return false
+	if type(unit) == "string" then
+		if unit:find("^party%d+$") or unit:find("^raid%d+$") or unit:find("^partypet%d+$") or unit:find("^raidpet%d+$") then
+			return true
+		end
+	end
+	if IsGroupUnit(unit) then
+		return true
+	end
+	local guid = SafeGUID(unit)
+	if guid then
+		if GuidIsPlayerOrPet(guid) then
+			return true
+		end
+		if playerGUID and guid == playerGUID then
+			return true
+		end
+		if Exists("pet") and guid == SafeGUID("pet") then
+			return true
+		end
 	end
 	if UnitIsPlayerSafe(unit) == true then
-		return false
+		return true
+	end
+	if PlayerControlledSafe(unit) == true then
+		return true
+	end
+	if UnitIsOtherPlayersPet then
+		local ok, otherPet = pcall(UnitIsOtherPlayersPet, unit)
+		if ok and otherPet ~= nil and not IsSecret(otherPet) and otherPet then
+			return true
+		end
 	end
 	local myName = SafeName("player")
 	local name = SafeName(unit)
 	if myName and name and name == myName then
+		return true
+	end
+	return false
+end
+
+local function IsPublicFightToken(unit)
+	if not unit then
+		return false
+	end
+	if unit == "target" or unit == "focus" or unit == "mouseover" or unit == "pettarget" then
+		return true
+	end
+	return type(unit) == "string" and unit:find("target$") ~= nil and (unit:find("^party") or unit:find("^raid"))
+end
+
+-- Only world NPCs. Never players, pets, or player-controlled units.
+-- CreatureType is not proof: warlock/hunter pets are Demon/Beast.
+-- UnitCanAttack is not proof: nearby PvP players are attackable.
+local function HostileNPC(unit)
+	if not unit or not Exists(unit) or Dead(unit) then
+		return false
+	end
+	if IsPlayerSide(unit) then
 		return false
 	end
 	if UnitIsFriend then
@@ -296,50 +418,98 @@ local function HostileNPC(unit)
 			return false
 		end
 	end
-	if Enemy(unit) then
+	local kind = GuidKind(unit)
+	if kind == "Player" or kind == "Pet" or kind == "Item" or kind == "GameObject" or kind == "Vignette" then
+		return false
+	end
+	if kind == "Creature" or kind == "Vehicle" then
+		if PlayerControlledSafe(unit) == true or UnitIsPlayerSafe(unit) == true then
+			return false
+		end
 		return true
 	end
-	-- Forever may hide UnitCanAttack on nameplates. Still allow a live plate
-	-- only when we can prove it is an NPC, not a player.
-	if inCombat and (IsNameplateToken(unit) or IsVolatileUnit(unit)) then
-		if kind == "Creature" or kind == "Vehicle" then
-			return true
+	-- GUID hidden: never trust a random nameplate. Target / pettarget are OK
+	-- unless proven to be a player or a non-attackable unit.
+	if IsPublicFightToken(unit) then
+		if UnitIsPlayerSafe(unit) == true or PlayerControlledSafe(unit) == true then
+			return false
 		end
-		if CreatureTypeSafe(unit) then
-			return true
+		if AttackableState(unit) == false then
+			return false
 		end
-		if UnitIsPlayerSafe(unit) == false then
-			return true
+		return true
+	end
+	if IsNameplateToken(unit) then
+		local tokens = LH.PublicMobTokens()
+		for i = 1, #tokens do
+			if SameUnit(unit, tokens[i]) then
+				return true
+			end
 		end
 	end
 	return false
+end
+
+local function PersistableUnit(unit)
+	if not unit or IsNameplateToken(unit) or IsVolatileUnit(unit) then
+		return nil
+	end
+	if not HostileNPC(unit) then
+		return nil
+	end
+	return unit
+end
+
+local function Flag(v)
+	if v == nil then
+		return "nil"
+	end
+	if v == true then
+		return "true"
+	end
+	if v == false then
+		return "false"
+	end
+	return tostring(v)
+end
+
+local function Probe(unit)
+	if not unit then
+		return "nil"
+	end
+	if not Exists(unit) then
+		return tostring(unit) .. " gone"
+	end
+	return format(
+		"%s name=%s guid=%s kind=%s player=%s pctrl=%s atk=%s npc=%s side=%s",
+		tostring(unit),
+		SafeName(unit) or "?",
+		SafeGUID(unit) or "?",
+		GuidKind(unit) or "?",
+		Flag(UnitIsPlayerSafe(unit)),
+		Flag(PlayerControlledSafe(unit)),
+		Flag(AttackableState(unit)),
+		HostileNPC(unit) and "yes" or "no",
+		IsPlayerSide(unit) and "yes" or "no"
+	)
 end
 
 local function RecIsNotNPC(rec)
 	if not rec then
 		return true
 	end
-	local u = rec.anchor or rec.unit
-	if u and Exists(u) and not HostileNPC(u) then
+	if rec.guid and GuidIsPlayerOrPet(rec.guid) then
 		return true
-	end
-	if rec.guid and type(rec.guid) == "string" then
-		if rec.guid:find("^Player-") or rec.guid:find("^Pet-") then
-			return true
-		end
 	end
 	local myName = SafeName("player")
 	if myName and rec.name == myName then
-		if u and Exists(u) and HostileNPC(u) then
-			return false
-		end
 		return true
 	end
 	return false
 end
 
 local function StableAnchor(unit)
-	if not unit or not Exists(unit) then
+	if not unit or not Exists(unit) or not HostileNPC(unit) then
 		return nil
 	end
 	if IsNameplateToken(unit) then
@@ -347,7 +517,7 @@ local function StableAnchor(unit)
 	end
 	for i = 1, 40 do
 		local plate = "nameplate" .. i
-		if Exists(plate) and SameUnit(plate, unit) then
+		if Exists(plate) and HostileNPC(plate) and SameUnit(plate, unit) then
 			return plate
 		end
 	end
@@ -355,6 +525,32 @@ local function StableAnchor(unit)
 		return nil
 	end
 	return unit
+end
+
+local function ViewMatchesRec(rec, unit)
+	if not rec or not unit or not Exists(unit) or Dead(unit) or not HostileNPC(unit) then
+		return false
+	end
+	if rec.guid then
+		local guid = SafeGUID(unit)
+		return guid ~= nil and guid == rec.guid
+	end
+	-- Same name is not unique (two leopards). Only the stored token still
+	-- pointing at this exact unit counts.
+	if rec.anchor and (unit == rec.anchor or SameUnit(rec.anchor, unit)) then
+		return true
+	end
+	return false
+end
+
+local function DisplayUnit(rec)
+	if rec.anchor and ViewMatchesRec(rec, rec.anchor) then
+		return rec.anchor
+	end
+	if rec.unit and ViewMatchesRec(rec, rec.unit) then
+		return rec.unit
+	end
+	return nil
 end
 
 function LH.DurationForLevel(level)
@@ -582,27 +778,57 @@ function LH.TimerColor(remain, duration)
 	return 0.95, 0.22, 0.18
 end
 
+-- Player/pet hit on one mob refreshes the whole fight (Classic linked packs).
+local PACK_HIT_REASONS = {
+	combat = true,
+	cast = true,
+	cleu = true,
+	pull = true,
+	["combat-fallback-target"] = true,
+	["combat-fallback-pet"] = true,
+}
+
+local function RefreshPackLeashes(exceptKey, now)
+	for key, rec in pairs(mobs) do
+		if key ~= "test" and key ~= exceptKey then
+			local dur = rec.duration or 11
+			local unit = rec.anchor or rec.unit
+			local cc = unit and Exists(unit) and not Dead(unit) and AuraIsCC(unit)
+			if cc then
+				rec.pauseLeft = dur
+				rec.paused = true
+			else
+				rec.expires = now + dur
+				rec.paused = false
+				rec.pauseLeft = nil
+			end
+			rec.lastHit = now
+			rec.seenInCombat = true
+			rec.oocSince = nil
+			rec.reason = "pack"
+		end
+	end
+end
+
 function LH.ResetLeash(unit, reason)
 	if not AddonActive() then
+		if db and db.debug then
+			Dbg("reset skipped (addon off) %s", tostring(reason))
+		end
 		return
 	end
-	local key, token
-	if unit then
-		key, token = MobKey(unit)
+	if not unit or not HostileNPC(unit) then
+		if db and db.debug then
+			Dbg("reset skip %s %s", tostring(reason), Probe(unit))
+		end
+		return
 	end
+	local key, token = MobKey(unit)
 	if not key then
-		local only, n = nil, 0
-		for k in pairs(mobs) do
-			if k ~= "test" then
-				n = n + 1
-				only = k
-			end
+		if db and db.debug then
+			Dbg("reset no-key %s %s", tostring(reason), Probe(unit))
 		end
-		if n == 1 then
-			key = only
-		else
-			return
-		end
+		return
 	end
 	lastFightKey = key
 	local now = GetTime()
@@ -610,15 +836,19 @@ function LH.ResetLeash(unit, reason)
 	local duration = LH.DurationForLevel(SafeLevel(token or unit))
 	if rec and rec.duration then
 		duration = rec.duration
-		if token or (unit and Exists(unit)) then
-			duration = LH.DurationForLevel(SafeLevel(token or unit))
-		end
+		duration = LH.DurationForLevel(SafeLevel(token or unit))
 	end
-	local cc = (token or unit) and AuraIsCC(token or unit)
+	local cc = AuraIsCC(token or unit)
 	local persist = PersistableUnit(ResolvePublicUnit(token or unit) or token)
 	local anchor = StableAnchor(token or unit)
 	local guid = SafeGUID(token or unit)
-	local name = SafeName(token or unit) or (persist and SafeName(persist)) or "Mob"
+	if guid and GuidIsPlayerOrPet(guid) then
+		return
+	end
+	local name = SafeName(token or unit) or (persist and SafeName(persist))
+	if not name or name == SafeName("player") then
+		name = rec and rec.name or "Mob"
+	end
 	if rec then
 		rec.duration = duration
 		rec.expires = now + duration
@@ -628,7 +858,9 @@ function LH.ResetLeash(unit, reason)
 		if anchor then
 			rec.anchor = anchor
 		end
-		rec.name = name ~= "Mob" and name or rec.name
+		if name ~= "Mob" then
+			rec.name = name
+		end
 		rec.guid = guid or rec.guid
 		rec.paused = cc and true or false
 		rec.pauseLeft = cc and duration or nil
@@ -651,6 +883,12 @@ function LH.ResetLeash(unit, reason)
 			lastHit = now,
 		}
 	end
+	if db and db.debug then
+		Dbg("reset %s key=%s name=%s dur=%.0f", tostring(reason), tostring(key), tostring(name), duration)
+	end
+	if reason and PACK_HIT_REASONS[reason] then
+		RefreshPackLeashes(key, now)
+	end
 end
 
 local function DropKey(key)
@@ -672,7 +910,7 @@ local function ApplyInstanceState()
 	if not db then
 		return
 	end
-	if db.disableInDungeons and InDungeon() then
+	if db.disableInDungeons and InDungeon() and not db.preview then
 		ClearAll()
 		if window then
 			window:Hide()
@@ -682,8 +920,8 @@ end
 
 local function PauseIfCC()
 	for _, rec in pairs(mobs) do
-		local unit = rec.anchor or rec.unit
-		if unit and Exists(unit) then
+		local unit = DisplayUnit(rec) or rec.unit
+		if unit and Exists(unit) and HostileNPC(unit) then
 			local cc = AuraIsCC(unit)
 			if cc and not rec.paused then
 				rec.pauseLeft = LH.Remaining(rec)
@@ -724,13 +962,16 @@ local function EachVisibleEnemy(fn)
 end
 
 local function LiveUnit(rec)
-	if rec.anchor and Exists(rec.anchor) then
+	if rec.anchor and ViewMatchesRec(rec, rec.anchor) then
 		return rec.anchor
+	end
+	if rec.anchor then
+		rec.anchor = nil
 	end
 	if rec.guid then
 		local found
 		EachVisibleEnemy(function(unit)
-			if found then
+			if found or Dead(unit) then
 				return
 			end
 			if SafeGUID(unit) == rec.guid then
@@ -742,6 +983,9 @@ local function LiveUnit(rec)
 			return found
 		end
 	end
+	if rec.unit and ViewMatchesRec(rec, rec.unit) then
+		return rec.unit
+	end
 	return nil
 end
 
@@ -750,10 +994,10 @@ local function DropIfLeftCombat(key, rec)
 	if not rec or key == "test" then
 		return false
 	end
-	if rec.unit and (not Exists(rec.unit) or IsVolatileUnit(rec.unit)) then
+	if rec.unit and (not Exists(rec.unit) or IsVolatileUnit(rec.unit) or not HostileNPC(rec.unit)) then
 		rec.unit = nil
 	end
-	if rec.anchor and not Exists(rec.anchor) then
+	if rec.anchor and (not Exists(rec.anchor) or not ViewMatchesRec(rec, rec.anchor)) then
 		rec.anchor = nil
 	end
 	if rec.anchor and IsVolatileUnit(rec.anchor) then
@@ -777,6 +1021,9 @@ local function DropIfLeftCombat(key, rec)
 			rec.unit = persist
 		end
 		rec.name = SafeName(unit) or rec.name
+		if rec.name == SafeName("player") then
+			rec.name = "Mob"
+		end
 		return false
 	end
 	if combat == false and rec.seenInCombat then
@@ -790,49 +1037,104 @@ local function DropIfLeftCombat(key, rec)
 	return false
 end
 
--- If we can see the pack, drop leftover rows that no longer have an in-combat
--- mob of that name (the one that leashed / ran out of plate range).
-local function DropUnmatchedExtras()
-	local byName = {}
-	for key, rec in pairs(mobs) do
-		if key ~= "test" then
-			local name = rec.name or "?"
-			byName[name] = byName[name] or {}
-			byName[name][#byName[name] + 1] = { key = key, rec = rec }
+-- One visible in-combat NPC can own at most one timer. Extra rows for the
+-- same name (the leopard you just killed) are dropped while you stay in combat.
+local function RebindVisibleMobs()
+	local vis = {}
+	local seenU = {}
+	EachVisibleEnemy(function(u)
+		if Dead(u) or CombatState(u) == false then
+			return
 		end
+		local guid = SafeGUID(u)
+		local id = guid or u
+		if seenU[id] then
+			return
+		end
+		seenU[id] = true
+		vis[#vis + 1] = { unit = u, guid = guid, name = SafeName(u) or "?" }
+	end)
+
+	local used = {}
+	local bound = {}
+
+	local function claim(key, i)
+		local rec = mobs[key]
+		if not rec then
+			return
+		end
+		used[i] = true
+		bound[key] = i
+		rec.anchor = StableAnchor(vis[i].unit) or rec.anchor
+		if vis[i].guid then
+			rec.guid = rec.guid or vis[i].guid
+		end
+		rec.oocSince = nil
 	end
-	for name, list in pairs(byName) do
-		local seenCombat = 0
-		EachVisibleEnemy(function(u)
-			if SafeName(u) == name and CombatState(u) == true then
-				seenCombat = seenCombat + 1
-			end
-		end)
-		if seenCombat == 0 then
-			-- Pack is off-screen; keep timers until PLAYER_REGEN_ENABLED.
-		else
-			local anchored = 0
-			local extras = {}
-			for i = 1, #list do
-				local rec = list[i].rec
-				local a = rec.anchor
-				if a and Exists(a) and CombatState(a) == true then
-					anchored = anchored + 1
-				else
-					extras[#extras + 1] = list[i]
+
+	for key, rec in pairs(mobs) do
+		if key ~= "test" and rec.guid then
+			for i = 1, #vis do
+				if not used[i] and vis[i].guid == rec.guid then
+					claim(key, i)
+					break
 				end
 			end
-			table.sort(extras, function(a, b)
-				return (a.rec.lastHit or 0) < (b.rec.lastHit or 0)
-			end)
-			local slots = seenCombat - anchored
-			if slots < 0 then
-				slots = 0
-			end
-			for i = 1, #extras - slots do
-				DropKey(extras[i].key)
+		end
+	end
+
+	for key, rec in pairs(mobs) do
+		if key ~= "test" and not bound[key] and rec.anchor and Exists(rec.anchor) and not Dead(rec.anchor) then
+			for i = 1, #vis do
+				if not used[i] and (rec.anchor == vis[i].unit or SameUnit(rec.anchor, vis[i].unit)) then
+					claim(key, i)
+					break
+				end
 			end
 		end
+	end
+
+	local leftoverVis = {}
+	for i = 1, #vis do
+		if not used[i] then
+			local n = vis[i].name
+			leftoverVis[n] = leftoverVis[n] or {}
+			leftoverVis[n][#leftoverVis[n] + 1] = i
+		end
+	end
+	local leftoverRecs = {}
+	for key, rec in pairs(mobs) do
+		if key ~= "test" and not bound[key] then
+			local n = rec.name or "?"
+			leftoverRecs[n] = leftoverRecs[n] or {}
+			leftoverRecs[n][#leftoverRecs[n] + 1] = key
+		end
+	end
+
+	local visCount = {}
+	for i = 1, #vis do
+		visCount[vis[i].name] = (visCount[vis[i].name] or 0) + 1
+	end
+
+	local drop = {}
+	for n, keys in pairs(leftoverRecs) do
+		table.sort(keys, function(a, b)
+			return (mobs[a].lastHit or 0) > (mobs[b].lastHit or 0)
+		end)
+		local slots = leftoverVis[n] or {}
+		for j = 1, #keys do
+			if j <= #slots then
+				claim(keys[j], slots[j])
+			elseif (visCount[n] or 0) > 0 then
+				drop[#drop + 1] = keys[j]
+			end
+		end
+	end
+	for i = 1, #drop do
+		if db and db.debug then
+			Dbg("drop dead/extra %s", tostring(drop[i]))
+		end
+		DropKey(drop[i])
 	end
 end
 
@@ -862,7 +1164,7 @@ local function Prune()
 			end
 		end
 	end
-	DropUnmatchedExtras()
+	RebindVisibleMobs()
 end
 
 local function Accent()
@@ -914,12 +1216,108 @@ local function OrderedMobs()
 	return list
 end
 
+local function CanDrag()
+	if not db then
+		return false
+	end
+	return db.preview or not db.locked
+end
+
 local function ApplyLock()
 	if not window then
 		return
 	end
-	window:EnableMouse(not db.locked)
-	window:SetMovable(not db.locked)
+	local drag = CanDrag()
+	window:EnableMouse(drag)
+	window:SetMovable(drag)
+end
+
+local PREVIEW_SAMPLES = {
+	{ name = "Scorpashi Lasher", duration = 13, offset = 0, icon = "Interface\\Icons\\Ability_Hunter_Pet_Scorpid" },
+	{ name = "Scorpashi Lasher", duration = 13, offset = 6.6, icon = "Interface\\Icons\\Ability_Hunter_Pet_Scorpid" },
+	{ name = "Scorpashi Venomspitter", duration = 13, offset = 10.9, icon = "Interface\\Icons\\Ability_Hunter_Pet_Spider" },
+}
+
+local function PreviewList()
+	local now = GetTime()
+	local list = {}
+	for i = 1, #PREVIEW_SAMPLES do
+		local s = PREVIEW_SAMPLES[i]
+		local remain = s.duration - ((now + s.offset) % s.duration)
+		list[i] = {
+			name = s.name,
+			duration = s.duration,
+			icon = s.icon,
+			previewRemain = remain,
+		}
+	end
+	return list
+end
+
+local function HasRealMobs()
+	for key in pairs(mobs) do
+		if key ~= "test" then
+			return true
+		end
+	end
+	return false
+end
+
+local function UpdatePreviewChrome()
+	if not window then
+		return
+	end
+	if not window.previewBg then
+		local bg = window:CreateTexture(nil, "BACKGROUND")
+		bg:SetColorTexture(0.02, 0.05, 0.07, 0.62)
+		bg:SetPoint("TOPLEFT", -10, 22)
+		bg:SetPoint("BOTTOMRIGHT", 10, -10)
+		window.previewBg = bg
+		local edge = window:CreateTexture(nil, "BORDER")
+		edge:SetColorTexture(12 / 255, 210 / 255, 157 / 255, 0.55)
+		edge:SetPoint("TOPLEFT", bg, "TOPLEFT")
+		edge:SetPoint("TOPRIGHT", bg, "TOPRIGHT")
+		edge:SetHeight(1)
+		window.previewEdgeT = edge
+		local edgeB = window:CreateTexture(nil, "BORDER")
+		edgeB:SetColorTexture(12 / 255, 210 / 255, 157 / 255, 0.55)
+		edgeB:SetPoint("BOTTOMLEFT", bg, "BOTTOMLEFT")
+		edgeB:SetPoint("BOTTOMRIGHT", bg, "BOTTOMRIGHT")
+		edgeB:SetHeight(1)
+		window.previewEdgeB = edgeB
+		local edgeL = window:CreateTexture(nil, "BORDER")
+		edgeL:SetColorTexture(12 / 255, 210 / 255, 157 / 255, 0.55)
+		edgeL:SetPoint("TOPLEFT", bg, "TOPLEFT")
+		edgeL:SetPoint("BOTTOMLEFT", bg, "BOTTOMLEFT")
+		edgeL:SetWidth(1)
+		window.previewEdgeL = edgeL
+		local edgeR = window:CreateTexture(nil, "BORDER")
+		edgeR:SetColorTexture(12 / 255, 210 / 255, 157 / 255, 0.55)
+		edgeR:SetPoint("TOPRIGHT", bg, "TOPRIGHT")
+		edgeR:SetPoint("BOTTOMRIGHT", bg, "BOTTOMRIGHT")
+		edgeR:SetWidth(1)
+		window.previewEdgeR = edgeR
+		local hint = window:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		pcall(hint.SetFont, hint, "Fonts\\ARIALN.TTF", 12, "OUTLINE")
+		hint:SetPoint("BOTTOMLEFT", window, "TOPLEFT", 0, 6)
+		hint:SetTextColor(12 / 255, 210 / 255, 157 / 255, 1)
+		hint:SetText("Previsualize — drag to move")
+		window.previewHint = hint
+	end
+	local on = db and db.preview
+	window.previewBg:SetShown(on)
+	window.previewEdgeT:SetShown(on)
+	window.previewEdgeB:SetShown(on)
+	window.previewEdgeL:SetShown(on)
+	window.previewEdgeR:SetShown(on)
+	window.previewHint:SetShown(on)
+	if window.SetHitRectInsets then
+		if on then
+			window:SetHitRectInsets(-10, -10, -24, -10)
+		else
+			window:SetHitRectInsets(0, 0, 0, 0)
+		end
+	end
 end
 
 local function LayoutBar()
@@ -964,8 +1362,8 @@ function LH.LayoutRows(parent, pool, list)
 	local usedW = 40
 	for i = 1, #list do
 		local rec = list[i]
-		local view = rec.anchor or rec.unit
-		if view and Exists(view) then
+		local view = DisplayUnit(rec)
+		if view then
 			rec.name = SafeName(view) or rec.name
 		end
 		local row = AcquireRow(parent, pool, i)
@@ -990,9 +1388,9 @@ function LH.LayoutRows(parent, pool, list)
 					row.icon:SetTexture(rec.icon)
 					row.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
 				end
-			elseif view and Exists(view) and SetPortraitTexture then
+			elseif view and SetPortraitTexture then
 				pcall(SetPortraitTexture, row.icon, view)
-			elseif not row.icon:GetTexture() then
+			else
 				row.icon:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
 				row.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
 			end
@@ -1070,7 +1468,7 @@ local function CreateWindow()
 	window:SetMovable(true)
 	window:RegisterForDrag("LeftButton")
 	window:SetScript("OnDragStart", function(self)
-		if db.locked then
+		if not CanDrag() then
 			return
 		end
 		self:StartMoving()
@@ -1082,6 +1480,7 @@ local function CreateWindow()
 	end)
 	ApplyLock()
 	LayoutBar()
+	UpdatePreviewChrome()
 	window:Hide()
 	LH.window = window
 end
@@ -1089,6 +1488,9 @@ end
 local function ShouldShowBar()
 	if not db or not db.enabled then
 		return false
+	end
+	if db.preview then
+		return true
 	end
 	if testUntil > GetTime() then
 		return true
@@ -1104,6 +1506,9 @@ local function PaintWindow()
 		return
 	end
 	local list = OrderedMobs()
+	if db and db.preview and not HasRealMobs() then
+		list = PreviewList()
+	end
 	if not ShouldShowBar() or #list == 0 then
 		window:Hide()
 		return
@@ -1111,12 +1516,19 @@ local function PaintWindow()
 	window:Show()
 	rows = rows or {}
 	LH.LayoutRows(window, rows, list)
+	UpdatePreviewChrome()
 end
 
 local function Tick()
-	PauseIfCC()
-	Prune()
-	PaintWindow()
+	local ok, err = pcall(function()
+		PauseIfCC()
+		Prune()
+		PaintWindow()
+	end)
+	if not ok then
+		lastTickErr = tostring(err)
+		Dbg("TICK ERROR %s", lastTickErr)
+	end
 end
 
 local function StartTicker()
@@ -1167,13 +1579,15 @@ end
 
 local function HandleCombatHit(unit, action)
 	action = SafeStr(action)
-	local resolved = ResolvePublicUnit(unit)
-	-- Hits on you / your pet / group: refresh the mob you are fighting.
-	-- Never start a timer on the player nameplate or another player.
-	if IsGroupUnit(unit) or resolved == "player" or resolved == "pet" or IsGroupUnit(resolved) then
+	-- Hits on you / your pet / group / those nameplates: never start a timer
+	-- on that unit. Pet melee on a mob still arrives as UNIT_COMBAT on the mob
+	-- (or pettarget), not on the pet.
+	if IsPlayerSide(unit) then
 		if action == "WOUND" and PlayerStill() then
 			if HostileNPC("target") then
 				LH.ResetLeash("target", "melee-still")
+			elseif HostileNPC("pettarget") then
+				LH.ResetLeash("pettarget", "melee-still")
 			end
 		end
 		return
@@ -1181,8 +1595,16 @@ local function HandleCombatHit(unit, action)
 	if action ~= "WOUND" and action ~= "DODGE" and action ~= "PARRY" and action ~= "MISS" and action ~= "BLOCK" and action ~= "RESIST" then
 		return
 	end
-	local victim = resolved or unit
+	local victim = ResolvePublicUnit(unit) or unit
 	if not HostileNPC(victim) then
+		if db and db.debug then
+			Dbg("combat skip %s %s", tostring(action), Probe(unit))
+		end
+		if HostileNPC("target") then
+			LH.ResetLeash("target", "combat-fallback-target")
+		elseif HostileNPC("pettarget") then
+			LH.ResetLeash("pettarget", "combat-fallback-pet")
+		end
 		return
 	end
 	LH.ResetLeash(victim, "combat")
@@ -1215,6 +1637,9 @@ local function HandleCleU()
 		return
 	end
 	if destGUID:find("^Player-") or destGUID:find("^Pet-") then
+		return
+	end
+	if destGUID == playerGUID or (Exists("pet") and destGUID == SafeGUID("pet")) then
 		return
 	end
 	-- Map dest GUID onto a public unit we can see.
@@ -1251,17 +1676,29 @@ local function SafeRegister(frame, event)
 end
 
 function LH.OnOptionChanged(key)
+	CreateWindow()
 	ApplyLock()
 	LayoutBar()
 	if key == "enabled" or key == "disableInDungeons" then
 		ApplyInstanceState()
-		if not AddonActive() then
+		if not AddonActive() and not (db and db.preview) then
 			ClearAll()
 			if window then
 				window:Hide()
 			end
 		end
 	end
+	if key == "preview" then
+		StartTicker()
+	end
+	if key == "debug" then
+		if db.debug then
+			LH.ShowDebug()
+		elseif LH.debugFrame then
+			LH.debugFrame:Hide()
+		end
+	end
+	UpdatePreviewChrome()
 	Tick()
 	if LH.RefreshPreview then
 		LH.RefreshPreview()
@@ -1287,6 +1724,149 @@ local function Print(msg)
 	print("|cff0cd29dLeashHelperForever|r: " .. msg)
 end
 
+function LH.DumpState()
+	local pos = "n/a"
+	if db then
+		pos = format("%s %.1f,%.1f", tostring(db.point), tonumber(db.x) or 0, tonumber(db.y) or 0)
+	end
+	local shown = window and window:IsShown()
+	local lines = {
+		"=== LeashHelperForever 1.0.7 ===",
+		format("enabled=%s preview=%s locked=%s debug=%s", Flag(db and db.enabled), Flag(db and db.preview), Flag(db and db.locked), Flag(db and db.debug)),
+		format("inCombat=%s secrets=%s dungeon=%s active=%s", Flag(inCombat), Flag(SecretsOn()), Flag(InDungeon()), Flag(AddonActive())),
+		format("window=%s pos=%s", shown and "shown" or "hidden", pos),
+		format("tickErr=%s", lastTickErr or "none"),
+		"target: " .. Probe("target"),
+		"focus: " .. Probe("focus"),
+		"pet: " .. Probe("pet"),
+		"pettarget: " .. Probe("pettarget"),
+		"mobs:",
+	}
+	local n = 0
+	for k, rec in pairs(mobs) do
+		n = n + 1
+		local left = LH.Remaining(rec)
+		lines[#lines + 1] = format("  %s name=%s left=%.1f guid=%s reason=%s", tostring(k), tostring(rec.name), left, tostring(rec.guid), tostring(rec.reason))
+	end
+	if n == 0 then
+		lines[#lines + 1] = "  (none)"
+	end
+	lines[#lines + 1] = "--- log ---"
+	if #debugLines == 0 then
+		lines[#lines + 1] = "(empty — pull a mob with Debug log on, then press Snapshot)"
+	else
+		for i = 1, #debugLines do
+			lines[#lines + 1] = debugLines[i]
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
+local function CreateDebugWindow()
+	if LH.debugFrame then
+		return LH.debugFrame
+	end
+	local f = CreateFrame("Frame", "LeashHelperDebugFrame", UIParent)
+	f:SetSize(520, 420)
+	f:SetPoint("CENTER", 280, 0)
+	f:SetFrameStrata("DIALOG")
+	f:SetToplevel(true)
+	f:SetClampedToScreen(true)
+	f:EnableMouse(true)
+	f:SetMovable(true)
+	f:RegisterForDrag("LeftButton")
+	f:SetScript("OnDragStart", f.StartMoving)
+	f:SetScript("OnDragStop", f.StopMovingOrSizing)
+	local bg = f:CreateTexture(nil, "BACKGROUND")
+	bg:SetAllPoints()
+	bg:SetColorTexture(0.05, 0.07, 0.09, 0.97)
+	local title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	pcall(title.SetFont, title, "Fonts\\ARIALN.TTF", 16, "")
+	title:SetPoint("TOPLEFT", 14, -12)
+	title:SetTextColor(12 / 255, 210 / 255, 157 / 255, 1)
+	title:SetText("LeashHelper debug")
+	local hint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	pcall(hint.SetFont, hint, "Fonts\\ARIALN.TTF", 12, "")
+	hint:SetPoint("TOPLEFT", 14, -32)
+	hint:SetTextColor(1, 1, 1, 0.55)
+	hint:SetText("Click the text, Ctrl+A then Ctrl+C, and paste it in chat")
+	local close = CreateFrame("Button", nil, f)
+	close:SetSize(22, 22)
+	close:SetPoint("TOPRIGHT", -10, -10)
+	local closeFs = close:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	pcall(closeFs.SetFont, closeFs, "Fonts\\ARIALN.TTF", 18, "")
+	closeFs:SetPoint("CENTER", 0, 1)
+	closeFs:SetText("×")
+	close:SetScript("OnClick", function()
+		f:Hide()
+		if db then
+			db.debug = false
+			if LH.RefreshPreview then
+				LH.RefreshPreview()
+			end
+		end
+	end)
+	local scroll = CreateFrame("ScrollFrame", "LeashHelperDebugScroll", f, "UIPanelScrollFrameTemplate")
+	scroll:SetPoint("TOPLEFT", 14, -54)
+	scroll:SetPoint("BOTTOMRIGHT", -36, 48)
+	local edit = CreateFrame("EditBox", "LeashHelperDebugEdit", scroll)
+	edit:SetMultiLine(true)
+	edit:SetFontObject(ChatFontNormal)
+	edit:SetWidth(450)
+	edit:SetAutoFocus(false)
+	edit:SetScript("OnEscapePressed", function(self)
+		self:ClearFocus()
+	end)
+	scroll:SetScrollChild(edit)
+	f.edit = edit
+	local function makeBtn(label, x)
+		local b = CreateFrame("Button", nil, f)
+		b:SetSize(90, 24)
+		b:SetPoint("BOTTOMLEFT", x, 12)
+		local bbg = b:CreateTexture(nil, "BACKGROUND")
+		bbg:SetAllPoints()
+		bbg:SetColorTexture(0.10, 0.12, 0.14, 1)
+		local bfs = b:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		pcall(bfs.SetFont, bfs, "Fonts\\ARIALN.TTF", 12, "")
+		bfs:SetPoint("CENTER")
+		bfs:SetText(label)
+		return b
+	end
+	local snap = makeBtn("Snapshot", 14)
+	snap:SetScript("OnClick", function()
+		edit:SetText(LH.DumpState())
+		edit:HighlightText()
+		edit:SetFocus()
+	end)
+	local clr = makeBtn("Clear log", 112)
+	clr:SetScript("OnClick", function()
+		wipe(debugLines)
+		lastTickErr = nil
+		edit:SetText(LH.DumpState())
+	end)
+	local function Refresh()
+		if f:IsShown() then
+			edit:SetText(LH.DumpState())
+		end
+	end
+	LH.RefreshDebug = Refresh
+	f:SetScript("OnShow", Refresh)
+	LH.debugFrame = f
+	tinsert(UISpecialFrames, "LeashHelperDebugFrame")
+	return f
+end
+
+function LH.ShowDebug()
+	if db then
+		db.debug = true
+	end
+	Dbg("debug window opened")
+	CreateDebugWindow():Show()
+	if LH.RefreshDebug then
+		LH.RefreshDebug()
+	end
+end
+
 SLASH_LEASHHELPER1 = "/leash"
 SLASH_LEASHHELPER2 = "/leashhelper"
 
@@ -1297,11 +1877,20 @@ SlashCmdList.LEASHHELPER = function(msg)
 		print("  |cffffff00/leash|r - open options")
 		print("  |cffffff00/leash lock|r - lock/unlock the display")
 		print("  |cffffff00/leash test|r - preview an 11s timer")
+		print("  |cffffff00/leash preview|r - toggle on-screen previsualize")
+		print("  |cffffff00/leash debug|r - open copyable debug log")
 		print("  |cffffff00/leash reset|r - reset position")
 	elseif msg == "lock" or msg == "unlock" then
 		db.locked = not db.locked
 		ApplyLock()
 		Print(db.locked and "locked." or "unlocked. Drag to move.")
+	elseif msg == "preview" or msg == "previsualize" then
+		db.preview = not db.preview
+		LH.OnOptionChanged("preview")
+		Print(db.preview and "previsualize on. Drag the timer to move it." or "previsualize off.")
+	elseif msg == "debug" then
+		LH.ShowDebug()
+		Print("debug log open. Ctrl+A, Ctrl+C, then paste it here.")
 	elseif msg == "test" then
 		LH.StartTest()
 		Print("showing a sample leash timer.")
@@ -1333,6 +1922,7 @@ eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 SafeRegister(eventFrame, "ZONE_CHANGED_NEW_AREA")
 SafeRegister(eventFrame, "UNIT_FLAGS")
 SafeRegister(eventFrame, "NAME_PLATE_UNIT_ADDED")
+SafeRegister(eventFrame, "NAME_PLATE_UNIT_REMOVED")
 SafeRegister(eventFrame, "UNIT_THREAT_SITUATION_UPDATE")
 
 eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
@@ -1372,12 +1962,20 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
 	end
 	if event == "PLAYER_REGEN_DISABLED" then
 		inCombat = true
+		if db and db.debug then
+			Dbg("enter combat  %s", Probe("target"))
+		end
 		if HostileNPC("target") then
 			LH.ResetLeash("target", "pull")
+		elseif db and db.debug then
+			Dbg("pull skipped, target not npc")
 		end
 		StartTicker()
 	elseif event == "PLAYER_REGEN_ENABLED" then
 		inCombat = false
+		if db and db.debug then
+			Dbg("leave combat")
+		end
 		DropCombatMobs()
 		Tick()
 	elseif event == "PLAYER_TARGET_CHANGED" then
@@ -1389,10 +1987,10 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
 				rec.anchor = nil
 			end
 		end
-		if Exists("target") then
+		if Exists("target") and HostileNPC("target") then
 			for _, rec in pairs(mobs) do
 				if rec.anchor and SameUnit(rec.anchor, "target") then
-					rec.unit = "target"
+					rec.unit = PersistableUnit("target")
 				end
 			end
 		end
@@ -1403,6 +2001,14 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
 				rec.unit = nil
 			end
 			if rec.anchor == "focus" then
+				rec.anchor = nil
+			end
+		end
+		Tick()
+	elseif event == "NAME_PLATE_UNIT_REMOVED" then
+		local plate = SafeStr(arg1) or arg1
+		for _, rec in pairs(mobs) do
+			if rec.anchor == plate then
 				rec.anchor = nil
 			end
 		end
@@ -1426,8 +2032,13 @@ eventFrame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
 		if not HostileSpell(spellId, name) then
 			return
 		end
-		local dest = unit == "pet" and "pettarget" or "target"
-		if HostileNPC(dest) then
+		local dest
+		if unit == "pet" then
+			dest = HostileNPC("pettarget") and "pettarget" or (HostileNPC("target") and "target")
+		else
+			dest = HostileNPC("target") and "target" or (HostileNPC("pettarget") and "pettarget")
+		end
+		if dest then
 			LH.ResetLeash(dest, "cast")
 		end
 	elseif event == "UNIT_COMBAT" then

@@ -471,7 +471,7 @@ local function CreateOptions()
 	note:SetPoint("BOTTOMRIGHT", body, "BOTTOMRIGHT", 0, 0)
 	note:SetJustifyH("LEFT")
 	note:SetWordWrap(true)
-	note:SetText("Each row is one mob. Hitting any of them refreshes the leash on the whole pack, like Classic. When a mob dies or leaves combat, only that row disappears.")
+	note:SetText("Each row is one mob. Hitting any of them refreshes the leash on the whole pack, like Classic. A row disappears when that mob dies, leaves combat, or its timer reaches 0.")
 
 	f:SetScript("OnHide", HideMenu)
 	f:SetScript("OnShow", function()
